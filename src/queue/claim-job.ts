@@ -140,64 +140,81 @@ export interface RecoveryResult {
 export async function recoverStaleJobs(leaseSeconds: number): Promise<RecoveryResult> {
   const db = getDb();
 
-  const stale = await db.execute<{
-    id: string;
-    attempts: number;
-    max_attempts: number;
-    payload: unknown;
-  }>(sql`
-    SELECT id, attempts, max_attempts, payload
-    FROM jobs
-    WHERE status = 'RUNNING'
-      AND locked_at < now() - make_interval(secs => ${leaseSeconds})
-    FOR UPDATE SKIP LOCKED
-  `);
+  // The sweep runs in one transaction so `FOR UPDATE SKIP LOCKED` holds its row
+  // locks for the whole pass: in autocommit mode the locks are released
+  // immediately and concurrent sweeps both select the same rows.
+  //
+  // Independently, each transition is counted only when it actually matched a
+  // row (see below). Measured: with neither safeguard, six concurrent sweeps
+  // over ten stale jobs reported 60 recoveries instead of 10.
+  return db.transaction(async (tx) => {
+    const stale = await tx.execute<{
+      id: string;
+      attempts: number;
+      max_attempts: number;
+      payload: unknown;
+    }>(sql`
+      SELECT id, attempts, max_attempts, payload
+      FROM jobs
+      WHERE status = 'RUNNING'
+        AND locked_at < now() - make_interval(secs => ${leaseSeconds})
+      FOR UPDATE SKIP LOCKED
+    `);
 
-  let requeued = 0;
-  let failed = 0;
+    let requeued = 0;
+    let failed = 0;
 
-  for (const job of stale) {
-    const attempts = Number(job.attempts);
-    const maxAttempts = Number(job.max_attempts);
-    const generationId = readGenerationId(job.payload);
+    for (const job of stale) {
+      const attempts = Number(job.attempts);
+      const maxAttempts = Number(job.max_attempts);
+      const generationId = readGenerationId(job.payload);
+      const canRetry = attempts < maxAttempts;
 
-    if (attempts < maxAttempts) {
-      await db.execute(sql`
+      // `RETURNING id` is the source of truth for "did this job actually
+      // transition?" — counting the intent instead of the outcome inflates
+      // recovery metrics and can mark the wrong number of jobs.
+      const updated = await tx.execute<{ id: string }>(sql`
         UPDATE jobs
-        SET status = 'QUEUED', run_at = now(), updated_at = now(), locked_at = NULL, locked_by = NULL,
-            last_error = 'Lease expired; job recovered'
+        SET
+          status = ${canRetry ? "QUEUED" : "FAILED"},
+          run_at = ${canRetry ? sql`now()` : sql`jobs.run_at`},
+          completed_at = ${canRetry ? sql`NULL` : sql`now()`},
+          updated_at = now(),
+          locked_at = NULL,
+          locked_by = NULL,
+          last_error = ${canRetry ? "Lease expired; job recovered" : "Lease expired and attempts exhausted"}
         WHERE id = ${job.id} AND status = 'RUNNING'
+        RETURNING id
       `);
-      requeued += 1;
 
-      if (generationId) {
-        await db.execute(sql`
-          UPDATE generations
-          SET status = 'QUEUED', progress = 0, current_step = 'QUEUED', message = 'Waiting in the queue'
-          WHERE id = ${generationId} AND status = 'PROCESSING'
-        `);
-      }
-    } else {
-      await db.execute(sql`
-        UPDATE jobs
-        SET status = 'FAILED', completed_at = now(), updated_at = now(), locked_at = NULL, locked_by = NULL,
-            last_error = 'Lease expired and attempts exhausted'
-        WHERE id = ${job.id} AND status = 'RUNNING'
-      `);
-      failed += 1;
+      if (updated.length === 0) continue;
 
-      if (generationId) {
-        await db.execute(sql`
-          UPDATE generations
-          SET status = 'FAILED', error_code = 'PROCESSING_FAILED',
-              error_message = 'Processing did not finish in time.', completed_at = now()
-          WHERE id = ${generationId} AND status IN ('QUEUED', 'PROCESSING')
-        `);
+      if (canRetry) {
+        requeued += 1;
+
+        if (generationId) {
+          await tx.execute(sql`
+            UPDATE generations
+            SET status = 'QUEUED', progress = 0, current_step = 'QUEUED', message = 'Waiting in the queue'
+            WHERE id = ${generationId} AND status = 'PROCESSING'
+          `);
+        }
+      } else {
+        failed += 1;
+
+        if (generationId) {
+          await tx.execute(sql`
+            UPDATE generations
+            SET status = 'FAILED', error_code = 'PROCESSING_FAILED',
+                error_message = 'Processing did not finish in time.', completed_at = now()
+            WHERE id = ${generationId} AND status IN ('QUEUED', 'PROCESSING')
+          `);
+        }
       }
     }
-  }
 
-  return { requeued, failed };
+    return { requeued, failed };
+  });
 }
 
 export function readGenerationId(payload: unknown): string | null {

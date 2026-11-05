@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { and, eq, sql } from "drizzle-orm";
-import { getDb } from "../../src/db/client";
+import { getDatabase, getDb } from "../../src/db/client";
 import { assets, generations, jobs, users } from "../../src/db/schema";
 import { claimJob, markJobCompleted, recoverStaleJobs, requeueJob } from "../../src/queue/claim-job";
 import { computeRetry } from "../../src/queue/retry";
@@ -220,6 +220,30 @@ describe("stale job recovery", () => {
     const [row] = await getDb().select().from(jobs);
     expect(row!.status).toBe("RUNNING");
   });
+
+  test("concurrent sweeps over many jobs count each job exactly once", async () => {
+    // Regression: counting the *intent* to recover instead of the rows actually
+    // updated made concurrent sweeps double-count and inflate metrics.
+    const jobsSeeded = 10;
+    for (let i = 0; i < jobsSeeded; i += 1) {
+      const { generation } = await seedGeneration({ status: "PROCESSING" });
+      const job = await enqueue(generation.id);
+      await claimJob(`crashed-${i}`);
+      await getDb().execute(sql`UPDATE jobs SET locked_at = now() - interval '1 hour' WHERE id = ${job.id}`);
+    }
+
+    const passes = await Promise.all(Array.from({ length: 6 }, () => recoverStaleJobs(300)));
+    const totalRequeued = passes.reduce((sum, pass) => sum + pass.requeued, 0);
+    const totalFailed = passes.reduce((sum, pass) => sum + pass.failed, 0);
+
+    expect(totalRequeued).toBe(jobsSeeded);
+    expect(totalFailed).toBe(0);
+
+    const [requeuedRows] = await getDatabase().client`
+      SELECT count(*)::int AS n FROM jobs WHERE status = 'QUEUED'
+    `;
+    expect(Number(requeuedRows?.n)).toBe(jobsSeeded);
+  }, 60_000);
 
   test("two recovery passes do not double-requeue", async () => {
     const { generation } = await seedGeneration({ status: "PROCESSING" });
