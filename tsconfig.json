@@ -15,10 +15,9 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"],
-      "@social-resizer/contracts": ["contracts/src/index.ts"]
+      "@/*": ["./src/*"],
+      "@social-resizer/contracts": ["./contracts/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "drizzle.config.ts"],
