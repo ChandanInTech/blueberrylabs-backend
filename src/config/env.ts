@@ -43,6 +43,17 @@ const envSchema = z.object({
   DEMO_SESSION_TTL_HOURS: int(24, 1),
   /** When true, cookies are marked Secure. Defaults to on in production. */
   COOKIE_SECURE: z.enum(["true", "false", "auto"]).default("auto"),
+  /**
+   * Cookie SameSite policy.
+   *
+   * `lax` is the safe default and works when the frontend and API share a
+   * site. When they are on different registrable domains (for example
+   * `*.vercel.app` calling `*.up.railway.app`), the browser treats every
+   * request as cross-site and `lax` cookies are never sent — the session
+   * silently disappears. `none` is required there, and browsers only accept
+   * `SameSite=None` together with `Secure`.
+   */
+  COOKIE_SAME_SITE: z.enum(["lax", "strict", "none"]).default("lax"),
 
   STORAGE_DRIVER: z.enum(["s3", "filesystem"]).default("s3"),
   STORAGE_FILESYSTEM_ROOT: z.string().default("./.storage"),

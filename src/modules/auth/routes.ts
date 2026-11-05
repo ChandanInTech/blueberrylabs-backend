@@ -24,6 +24,21 @@ function cookieSecure(): boolean {
 }
 
 /**
+ * SameSite policy for the session and CSRF cookies.
+ *
+ * Browsers reject `SameSite=None` without `Secure`, so the two are coupled
+ * here rather than left to each call site.
+ */
+function cookieSameSite(): "lax" | "strict" | "none" {
+  const env = getEnv();
+  if (env.COOKIE_SAME_SITE === "none" && !cookieSecure()) {
+    // Refuse to emit a cookie the browser will silently drop.
+    throw new Error("COOKIE_SAME_SITE=none requires COOKIE_SECURE=true (or NODE_ENV=production)");
+  }
+  return env.COOKIE_SAME_SITE;
+}
+
+/**
  * Demo authentication.
  *
  * The server derives `userId` from the validated session row on every path; a
@@ -42,7 +57,7 @@ export const authRoutes = new Elysia({ prefix: "/auth", tags: ["auth"] })
         value: issued.token,
         httpOnly: true,
         path: "/",
-        sameSite: "lax",
+        sameSite: cookieSameSite(),
         secure: cookieSecure(),
         maxAge: ttlSeconds(),
       });
@@ -51,7 +66,7 @@ export const authRoutes = new Elysia({ prefix: "/auth", tags: ["auth"] })
         value: issued.csrfToken,
         httpOnly: false,
         path: "/",
-        sameSite: "lax",
+        sameSite: cookieSameSite(),
         secure: cookieSecure(),
         maxAge: ttlSeconds(),
       });
