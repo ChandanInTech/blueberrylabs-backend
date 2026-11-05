@@ -3,6 +3,7 @@ import { getEnv } from "../config/env";
 import { getDb } from "../db/client";
 import { type ScopedLogger, workerLogger } from "../observability/logger";
 import { increment, setGauge } from "../observability/metrics";
+import { markCurrentSpanError, withSpan } from "../observability/tracing";
 import { JobError } from "../utils/errors";
 import { instanceId } from "../utils/ids";
 import {
@@ -216,40 +217,53 @@ export class Worker {
     job: { id: string; type: string; payload: unknown; attempts: number; maxAttempts: number },
     log: ScopedLogger,
   ): Promise<void> {
-    const started = Date.now();
-    increment("jobs_started_total", { type: job.type });
-
-    const handler = HANDLERS[job.type];
-    if (!handler) {
-      await markJobFailed(job.id, this.id, `No handler registered for job type ${job.type}`);
-      increment("jobs_failed_total", { type: job.type });
-      log.error("worker.no_handler", { jobId: job.id, type: job.type });
-      return;
-    }
-
-    const leaseTimer = setInterval(
-      () => {
-        void renewLease(job.id, this.id).catch(() => {});
+    const generationId = readGenerationId(job.payload);
+    await withSpan(
+      "worker.job",
+      {
+        "job.type": job.type,
+        "job.id": job.id,
+        ...(generationId ? { "generation.id": generationId } : {}),
       },
-      Math.max(1000, (this.leaseSeconds * 1000) / 3),
+      async () => {
+        const started = Date.now();
+        increment("jobs_started_total", { type: job.type });
+
+        const handler = HANDLERS[job.type];
+        if (!handler) {
+          await markJobFailed(job.id, this.id, `No handler registered for job type ${job.type}`);
+          increment("jobs_failed_total", { type: job.type });
+          log.error("worker.no_handler", { jobId: job.id, type: job.type });
+          markCurrentSpanError(new Error(`No handler registered for job type ${job.type}`));
+          return;
+        }
+
+        const leaseTimer = setInterval(
+          () => {
+            void renewLease(job.id, this.id).catch(() => {});
+          },
+          Math.max(1000, (this.leaseSeconds * 1000) / 3),
+        );
+        leaseTimer.unref?.();
+
+        try {
+          await withTimeout(
+            handler(job.payload, log),
+            this.jobTimeoutSeconds * 1000,
+            `Job exceeded the ${this.jobTimeoutSeconds}s timeout`,
+          );
+
+          await markJobCompleted(job.id, this.id);
+          increment("jobs_completed_total", { type: job.type });
+          log.info("worker.job_completed", { jobId: job.id, durationMs: Date.now() - started });
+        } catch (error) {
+          markCurrentSpanError(error);
+          await this.handleFailure(job, error, log, Date.now() - started);
+        } finally {
+          clearInterval(leaseTimer);
+        }
+      },
     );
-    leaseTimer.unref?.();
-
-    try {
-      await withTimeout(
-        handler(job.payload, log),
-        this.jobTimeoutSeconds * 1000,
-        `Job exceeded the ${this.jobTimeoutSeconds}s timeout`,
-      );
-
-      await markJobCompleted(job.id, this.id);
-      increment("jobs_completed_total", { type: job.type });
-      log.info("worker.job_completed", { jobId: job.id, durationMs: Date.now() - started });
-    } catch (error) {
-      await this.handleFailure(job, error, log, Date.now() - started);
-    } finally {
-      clearInterval(leaseTimer);
-    }
   }
 
   private async handleFailure(

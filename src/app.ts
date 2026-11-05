@@ -18,6 +18,7 @@ import { healthRoutes } from "./modules/health/routes";
 import { assetRoutes, uploadRoutes } from "./modules/uploads/routes";
 import { logger } from "./observability/logger";
 import { renderMetrics } from "./observability/metrics";
+import { tracingPlugin } from "./observability/tracing";
 import { localStorageRoutes } from "./services/storage/local-routes";
 import { AppError } from "./utils/errors";
 
@@ -26,6 +27,9 @@ export function createApp() {
 
   return (
     new Elysia({ name: "social-resizer-api" })
+      // ---- OpenTelemetry (first-party Elysia plugin; no-op when disabled) ---
+      .use(tracingPlugin())
+
       // ---- request context + correlation id ---------------------------------
       .use(requestContextPlugin)
 
@@ -71,8 +75,14 @@ export function createApp() {
           },
           credentials: true,
           methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-          allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Request-Id"],
-          exposeHeaders: ["X-Request-Id", "RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"],
+          allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Request-Id", "traceparent"],
+          exposeHeaders: [
+            "X-Request-Id",
+            "X-Trace-Id",
+            "RateLimit-Limit",
+            "RateLimit-Remaining",
+            "RateLimit-Reset",
+          ],
           maxAge: 600,
         }),
       )

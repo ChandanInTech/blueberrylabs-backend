@@ -50,7 +50,7 @@ src/
 │   ├── storage/                StorageService + Railway S3 + filesystem adapters
 │   ├── image/sharp-processor.ts
 │   └── generation/             transactional enqueue + quotas
-└── observability/              JSON logs, metrics, optional Sentry/OTel, cleanup task
+└── observability/              JSON logs, metrics, optional OTel, cleanup task
 ```
 
 ## Queue semantics
@@ -104,3 +104,14 @@ generation can be traced end to end. `/metrics` exposes Prometheus text: request
 counts/latency, rate-limit rejections, upload counters, queue depth, job
 started/completed/failed/retried/recovered, and processing durations. Metric labels are
 deliberately low-cardinality — ids belong in logs.
+
+## Tracing (OpenTelemetry)
+
+Elysia's first-party `@elysia/opentelemetry` plugin — grouped lifecycle spans
+per request plus `record` worker spans, with `traceId` on every log line.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to a collector base URL (e.g.
+`http://otel-collector:4318`) to export traces over OTLP/HTTP;
+`OTEL_SERVICE_NAME` defaults to `blueberrylabs-backend`. Without an endpoint
+the plugin is not applied, so logs and `/metrics` work as before. Library
+auto-instrumentation is disabled: Bun only partially supports the Node
+patching it needs.

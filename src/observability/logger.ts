@@ -7,6 +7,7 @@ const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, er
 /** Correlation fields propagated through a request/job lifecycle. */
 export interface LogContext {
   requestId?: string;
+  traceId?: string;
   userId?: string;
   assetId?: string;
   generationId?: string;

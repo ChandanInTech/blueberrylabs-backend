@@ -4,6 +4,8 @@ import { increment, observe } from "../observability/metrics";
 
 export interface RequestContext {
   requestId: string;
+  /** OpenTelemetry trace id for this request, when tracing is enabled. */
+  traceId?: string;
   startedAt: number;
   log: ScopedLogger;
   /** Set by the auth middleware once a session is validated. */
@@ -44,9 +46,16 @@ export function resolveClientIp(headers: Record<string, string | undefined>): st
 export function createRequestContext(
   requestId: string,
   headers: Record<string, string | undefined>,
+  options: { traceId?: string } = {},
 ): RequestContext {
-  const log = logger.child({ requestId });
-  return { requestId, startedAt: performance.now(), log, clientIp: resolveClientIp(headers) };
+  const log = logger.child({ requestId, traceId: options.traceId });
+  return {
+    requestId,
+    traceId: options.traceId,
+    startedAt: performance.now(),
+    log,
+    clientIp: resolveClientIp(headers),
+  };
 }
 
 export function attachContext(request: Request, ctx: RequestContext): void {

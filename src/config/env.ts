@@ -113,8 +113,8 @@ const envSchema = z.object({
   /** Keep PNG output (instead of JPEG) when the source has an alpha channel. */
   IMAGE_PRESERVE_TRANSPARENCY: bool("true"),
 
-  SENTRY_DSN: z.string().default(""),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().default(""),
+  OTEL_SERVICE_NAME: z.string().min(1).default("blueberrylabs-backend"),
   METRICS_ENABLED: bool("true"),
 
   /** Overrides the auto-generated instance id used for job leases. */

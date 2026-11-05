@@ -2,10 +2,9 @@ import { createApp } from "./app";
 import { getEnv } from "./config/env";
 import { closeDatabase, getDatabase } from "./db/client";
 import { cleanupTask } from "./observability/cleanup";
-import { initErrorTracking } from "./observability/error-tracking";
 import { logger } from "./observability/logger";
 import { registerMetrics, resetMetrics } from "./observability/metrics";
-import { initTracing } from "./observability/tracing";
+import { shutdownTracing } from "./observability/tracing";
 import { Worker } from "./queue/worker";
 
 async function main(): Promise<void> {
@@ -15,8 +14,7 @@ async function main(): Promise<void> {
   resetMetrics();
   registerMetrics();
 
-  initTracing();
-  initErrorTracking();
+  // OpenTelemetry SDK starts when createApp() applies the tracing plugin.
 
   // Fail fast: a backend that cannot reach PostgreSQL is not ready to serve.
   try {
@@ -45,6 +43,7 @@ async function main(): Promise<void> {
     cleanup?.stop();
     await worker?.stop(Number(process.env.SHUTDOWN_GRACE_MS ?? 25_000));
     await app.stop().catch((error: unknown) => logger.exception("api.stop_failed", error));
+    await shutdownTracing();
     await closeDatabase();
     logger.info("process.shutdown_complete", { signal });
     process.exit(0);
