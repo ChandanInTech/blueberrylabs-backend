@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { EnvValidationError, getEnv, resetEnvCache } from "../../src/config/env";
 
 const base = {
@@ -23,6 +23,18 @@ const MANAGED_KEYS = [
   "RAILWAY_BUCKET_GENERATED_ACCESS_KEY_ID",
   "RAILWAY_BUCKET_GENERATED_SECRET_ACCESS_KEY",
 ] as const;
+
+/** Snapshot of the managed keys before the suite runs, restored after each test. */
+const ORIGINAL = new Map<string, string | undefined>(MANAGED_KEYS.map((key) => [key, process.env[key]]));
+
+afterEach(() => {
+  for (const key of MANAGED_KEYS) {
+    const original = ORIGINAL.get(key);
+    if (original === undefined) delete process.env[key];
+    else process.env[key] = original;
+  }
+  resetEnvCache();
+});
 
 function withEnv(overrides: Record<string, string | undefined>) {
   for (const key of MANAGED_KEYS) delete process.env[key];

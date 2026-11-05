@@ -41,6 +41,11 @@ describe("environment validation", () => {
   });
 
   test("requires bucket credentials for the s3 driver", () => {
+    // Clear every bucket variable first: another suite may have left them set,
+    // which would make this assertion pass or fail depending on file order.
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("RAILWAY_BUCKET_")) delete process.env[key];
+    }
     process.env = Object.assign({}, process.env, withEnv({ STORAGE_DRIVER: "s3" }));
     resetEnvCache();
     expect(() => getEnv()).toThrow(/RAILWAY_BUCKET_ENDPOINT/);
