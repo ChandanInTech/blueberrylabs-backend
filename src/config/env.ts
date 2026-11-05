@@ -49,8 +49,19 @@ const envSchema = z.object({
 
   RAILWAY_BUCKET_ENDPOINT: z.string().default(""),
   RAILWAY_BUCKET_REGION: z.string().default("auto"),
+  /** Shared credentials, used when per-bucket credentials are not supplied. */
   RAILWAY_BUCKET_ACCESS_KEY_ID: z.string().default(""),
   RAILWAY_BUCKET_SECRET_ACCESS_KEY: z.string().default(""),
+  /**
+   * Railway Buckets issue credentials scoped to a single bucket, so each bucket
+   * needs its own key pair. Falls back to the shared pair when unset.
+   */
+  RAILWAY_BUCKET_ORIGINALS_ACCESS_KEY_ID: z.string().default(""),
+  RAILWAY_BUCKET_ORIGINALS_SECRET_ACCESS_KEY: z.string().default(""),
+  RAILWAY_BUCKET_GENERATED_ACCESS_KEY_ID: z.string().default(""),
+  RAILWAY_BUCKET_GENERATED_SECRET_ACCESS_KEY: z.string().default(""),
+  /** Railway Buckets use virtual-host addressing; set true only for path-style endpoints. */
+  RAILWAY_BUCKET_FORCE_PATH_STYLE: bool("false"),
   RAILWAY_BUCKET_ORIGINALS: z.string().default("media-originals"),
   RAILWAY_BUCKET_GENERATED: z.string().default("media-generated"),
 
@@ -131,15 +142,35 @@ function parse(raw: Record<string, string | undefined>): Env {
   }
 
   if (env.STORAGE_DRIVER === "s3") {
-    const missing = (
+    const missing: string[] = [];
+    if (env.RAILWAY_BUCKET_ENDPOINT.trim() === "") {
+      missing.push("RAILWAY_BUCKET_ENDPOINT: required when STORAGE_DRIVER=s3");
+    }
+
+    // Each bucket needs a usable key pair: either its own, or the shared one.
+    const pairs = [
       [
-        ["RAILWAY_BUCKET_ENDPOINT", env.RAILWAY_BUCKET_ENDPOINT],
-        ["RAILWAY_BUCKET_ACCESS_KEY_ID", env.RAILWAY_BUCKET_ACCESS_KEY_ID],
-        ["RAILWAY_BUCKET_SECRET_ACCESS_KEY", env.RAILWAY_BUCKET_SECRET_ACCESS_KEY],
-      ] as const
-    )
-      .filter(([, value]) => value.trim() === "")
-      .map(([name]) => `${name}: required when STORAGE_DRIVER=s3`);
+        "ORIGINALS",
+        env.RAILWAY_BUCKET_ORIGINALS_ACCESS_KEY_ID,
+        env.RAILWAY_BUCKET_ORIGINALS_SECRET_ACCESS_KEY,
+      ],
+      [
+        "GENERATED",
+        env.RAILWAY_BUCKET_GENERATED_ACCESS_KEY_ID,
+        env.RAILWAY_BUCKET_GENERATED_SECRET_ACCESS_KEY,
+      ],
+    ] as const;
+
+    for (const [label, keyId, secret] of pairs) {
+      const hasOwn = keyId.trim() !== "" && secret.trim() !== "";
+      const hasShared =
+        env.RAILWAY_BUCKET_ACCESS_KEY_ID.trim() !== "" && env.RAILWAY_BUCKET_SECRET_ACCESS_KEY.trim() !== "";
+      if (!hasOwn && !hasShared) {
+        missing.push(
+          `RAILWAY_BUCKET_${label}_ACCESS_KEY_ID / RAILWAY_BUCKET_${label}_SECRET_ACCESS_KEY (or the shared RAILWAY_BUCKET_ACCESS_KEY_ID / RAILWAY_BUCKET_SECRET_ACCESS_KEY): required when STORAGE_DRIVER=s3`,
+        );
+      }
+    }
 
     if (missing.length > 0) {
       throw new EnvValidationError(missing);
