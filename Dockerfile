@@ -18,8 +18,10 @@ FROM deps AS build
 COPY tsconfig.json drizzle.config.ts ./
 COPY src ./src
 COPY contracts ./contracts
-# Ship the migrations and the compiled contracts package.
-RUN cd contracts && bun run build
+# The contracts package needs `tsc`, which `--production` omits. Install it in
+# the build stage only; the runtime stage copies the compiled dist and the
+# production node_modules from here.
+RUN cd contracts && bun install --frozen-lockfile && bun run build
 
 # ---- runtime ----------------------------------------------------------------
 FROM base AS runtime
