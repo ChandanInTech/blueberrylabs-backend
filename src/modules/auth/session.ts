@@ -1,4 +1,4 @@
-import { and, eq, isNull, lt } from "drizzle-orm";
+import { and, eq, isNull, lt, notExists } from "drizzle-orm";
 import { getEnv } from "../../config/env";
 import { getDb } from "../../db/client";
 import { access_codes, auth_sessions, users } from "../../db/schema";
@@ -41,6 +41,10 @@ export function hashCode(code: string): string {
 /**
  * Exchange an access code for a signed token.
  *
+ * Codes are permanent and reusable: the same code logs the same user in every
+ * time. `ACCESS_CODE_SINGLE_USE` exists only as an escape hatch for one-off
+ * invitation codes and defaults to off.
+ *
  * Runs in one transaction so a single-use code cannot be redeemed twice by two
  * concurrent requests: the `UPDATE ... WHERE redeemed_at IS NULL` both claims
  * the code and tells us whether we won the race.
@@ -54,7 +58,10 @@ export async function loginWithCode(code: string, log: ScopedLogger): Promise<Is
 
     if (!row) throw errors.unauthenticated("That access code is not valid.");
     if (row.revokedAt !== null) throw errors.unauthenticated("That access code has been revoked.");
-    if (row.expiresAt.getTime() <= Date.now()) throw errors.unauthenticated("That access code has expired.");
+    // A permanent code has no expiry; only invitation codes carry one.
+    if (row.expiresAt !== null && row.expiresAt.getTime() <= Date.now()) {
+      throw errors.unauthenticated("That access code has expired.");
+    }
 
     if (env.ACCESS_CODE_SINGLE_USE) {
       const claimed = await tx
@@ -126,13 +133,16 @@ export async function revokeSession(sessionId: string): Promise<void> {
 }
 
 /**
- * Create an access code for a user.
+ * Create the permanent access code for a user.
  *
- * The raw code is returned exactly once and never persisted; only its hash is
- * stored. Callers must show it to the operator immediately.
+ * One code per user, enforced by a unique index on `user_id`. The raw code is
+ * returned exactly once and never persisted; only its hash is stored. Callers
+ * must show it to the operator immediately.
+ *
+ * Throws if the user already has a code — use {@link getOrCreateAccessCode} to
+ * make that idempotent.
  */
 export async function createAccessCode(userId: string, label?: string): Promise<string> {
-  const env = getEnv();
   // 9 random bytes -> 12 base64url chars; strip to 10 alphanumerics for typing.
   const code = normaliseCode(randomToken(9)).slice(0, 10);
 
@@ -142,17 +152,72 @@ export async function createAccessCode(userId: string, label?: string): Promise<
       codeHash: hashCode(code),
       userId,
       label: label ?? null,
-      expiresAt: new Date(Date.now() + env.ACCESS_CODE_TTL_HOURS * 3600 * 1000),
+      // Permanent: no expiry, no single-use redemption.
+      expiresAt: null,
+      redeemedAt: null,
     });
 
   return code;
 }
 
-/** Create a demo user and an access code for it in one step. */
+/**
+ * Return the user's existing code, or create one.
+ *
+ * The raw code cannot be recovered from its hash, so an existing code is
+ * reported as "already issued" rather than re-shown. This is what makes
+ * backfilling codes for existing users safe to re-run.
+ */
+export async function getOrCreateAccessCode(
+  userId: string,
+  label?: string,
+): Promise<{ code: string; created: boolean }> {
+  const [existing] = await getDb()
+    .select({ id: access_codes.id })
+    .from(access_codes)
+    .where(eq(access_codes.userId, userId))
+    .limit(1);
+
+  if (existing) return { code: "", created: false };
+  return { code: await createAccessCode(userId, label), created: true };
+}
+
+/** Create a demo user and its permanent access code in one step. */
 export async function createDemoUserWithCode(label?: string): Promise<{ userId: string; code: string }> {
   const [user] = await getDb().insert(users).values({ kind: "DEMO" }).returning();
   if (!user) throw errors.internal(new Error("demo user insert returned no row"));
   return { userId: user.id, code: await createAccessCode(user.id, label) };
+}
+
+/**
+ * Issue a code for every user that does not have one.
+ *
+ * Used to backfill users created before codes became the login credential.
+ * Returns the newly minted codes so the operator can distribute them; users
+ * that already had a code are reported without one, because the raw value is
+ * unrecoverable.
+ */
+export async function backfillAccessCodes(
+  label?: string,
+): Promise<{ issued: Array<{ userId: string; code: string }>; skipped: string[] }> {
+  const orphans = await getDb()
+    .select({ id: users.id })
+    .from(users)
+    .where(
+      notExists(
+        getDb().select({ one: access_codes.id }).from(access_codes).where(eq(access_codes.userId, users.id)),
+      ),
+    );
+
+  const issued: Array<{ userId: string; code: string }> = [];
+  for (const user of orphans) {
+    issued.push({ userId: user.id, code: await createAccessCode(user.id, label) });
+  }
+
+  const withCodes = await getDb().select({ userId: access_codes.userId }).from(access_codes);
+  const issuedIds = new Set(issued.map((entry) => entry.userId));
+  const skipped = withCodes.map((row) => row.userId).filter((id) => !issuedIds.has(id));
+
+  return { issued, skipped };
 }
 
 /** Remove sessions that expired before `olderThan`. Called by the cleanup task. */

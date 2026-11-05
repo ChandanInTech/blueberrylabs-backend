@@ -2,7 +2,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createApp } from "../../src/app";
 import * as envModule from "../../src/config/env";
 import { getDatabase } from "../../src/db/client";
-import { createAccessCode, createDemoUserWithCode, hashCode } from "../../src/modules/auth/session";
+import {
+  backfillAccessCodes,
+  createAccessCode,
+  createDemoUserWithCode,
+  getOrCreateAccessCode,
+  hashCode,
+} from "../../src/modules/auth/session";
 import { setStorageForTesting } from "../../src/services/storage";
 import { authedHeaders, bootTestRuntime, createSession, resetSingletons, truncateAll } from "../harness";
 import { setupTestDatabase, teardownTestDatabase, testDatabaseUrl } from "../setup-env";
@@ -96,17 +102,76 @@ describe("access-code login", () => {
     expect((await json(response)).error.code).toBe("UNAUTHENTICATED");
   });
 
-  test("rejects an expired code", async () => {
+  test("a permanent code has no expiry", async () => {
+    const { code, userId } = await createDemoUserWithCode();
+    const [row] = await getDatabase().client`
+      SELECT expires_at, redeemed_at FROM access_codes WHERE user_id = ${userId}
+    `;
+
+    expect(row?.expires_at).toBeNull();
+    expect(row?.redeemed_at).toBeNull();
+  });
+
+  test("the same code logs the same user in repeatedly", async () => {
+    const { code, userId } = await createDemoUserWithCode();
+
+    const logins = [];
+    for (let i = 0; i < 3; i += 1) {
+      const response = await fetch(`${url}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      expect(response.status).toBe(200);
+      logins.push(await json(response));
+    }
+
+    // Same identity every time, but a distinct session (and therefore token).
+    expect(logins.every((body) => body.user.id === userId)).toBe(true);
+    expect(new Set(logins.map((body) => body.token)).size).toBe(3);
+  });
+
+  test("concurrent logins with one code all succeed", async () => {
+    const { code, userId } = await createDemoUserWithCode();
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        fetch(`${url}/api/v1/auth/login`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ code }),
+        }),
+      ),
+    );
+
+    // A permanent code is reusable, so every request succeeds.
+    expect(responses.filter((r) => r.status === 200)).toHaveLength(8);
+    const bodies = await Promise.all(responses.map((r) => json(r)));
+    expect(bodies.every((body) => body.user.id === userId)).toBe(true);
+  });
+
+  test("rejects an expired code (invitation-style codes only)", async () => {
     const { userId } = await createDemoUserWithCode();
-    const code = await createAccessCode(userId, "expired");
     await getDatabase().client`
-      UPDATE access_codes SET expires_at = now() - interval '1 hour' WHERE code_hash = ${hashCode(code)}
+      UPDATE access_codes SET expires_at = now() - interval '1 hour' WHERE user_id = ${userId}
+    `;
+
+    const [row] = await getDatabase().client`
+      SELECT code_hash FROM access_codes WHERE user_id = ${userId}
+    `;
+    expect(row?.code_hash).toBeString();
+
+    // The code itself is unknown (only its hash is stored), so assert via a
+    // freshly created user whose code we do know.
+    const fresh = await createDemoUserWithCode();
+    await getDatabase().client`
+      UPDATE access_codes SET expires_at = now() - interval '1 hour' WHERE user_id = ${fresh.userId}
     `;
 
     const response = await fetch(`${url}/api/v1/auth/login`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code }),
+      body: JSON.stringify({ code: fresh.code }),
     });
 
     expect(response.status).toBe(401);
@@ -114,10 +179,9 @@ describe("access-code login", () => {
   });
 
   test("rejects a revoked code", async () => {
-    const { userId } = await createDemoUserWithCode();
-    const code = await createAccessCode(userId, "revoked");
+    const { code, userId } = await createDemoUserWithCode();
     await getDatabase().client`
-      UPDATE access_codes SET revoked_at = now() WHERE code_hash = ${hashCode(code)}
+      UPDATE access_codes SET revoked_at = now() WHERE user_id = ${userId}
     `;
 
     const response = await fetch(`${url}/api/v1/auth/login`, {
@@ -130,40 +194,48 @@ describe("access-code login", () => {
     expect((await json(response)).error.message).toContain("revoked");
   });
 
-  test("a single-use code cannot be redeemed twice", async () => {
-    const { code } = await createDemoUserWithCode();
+  test("a user can only have one code", async () => {
+    const { userId } = await createDemoUserWithCode();
 
-    const first = await fetch(`${url}/api/v1/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-    expect(first.status).toBe(200);
-
-    const second = await fetch(`${url}/api/v1/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-    expect(second.status).toBe(401);
-    expect((await json(second)).error.message).toContain("already been used");
+    // The unique index on user_id is what enforces "one code per user".
+    await expect(createAccessCode(userId, "second")).rejects.toThrow();
   });
 
-  test("concurrent redemptions of one code yield exactly one token", async () => {
-    const { code } = await createDemoUserWithCode();
+  test("getOrCreateAccessCode is idempotent", async () => {
+    const { userId } = await createDemoUserWithCode();
 
-    const responses = await Promise.all(
-      Array.from({ length: 8 }, () =>
-        fetch(`${url}/api/v1/auth/login`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ code }),
-        }),
-      ),
-    );
+    const first = await getOrCreateAccessCode(userId);
+    expect(first.created).toBe(false);
+    expect(first.code).toBe("");
 
-    expect(responses.filter((r) => r.status === 200)).toHaveLength(1);
-    expect(responses.filter((r) => r.status === 401)).toHaveLength(7);
+    const fresh = await createDemoUserWithCode();
+    const second = await getOrCreateAccessCode(fresh.userId);
+    expect(second.created).toBe(false);
+  });
+
+  test("backfill issues a code for every user that lacks one", async () => {
+    // Simulate pre-migration users: insert users with no code.
+    const db = getDatabase().client;
+    await db`INSERT INTO users (kind) VALUES ('DEMO'), ('DEMO'), ('DEMO')`;
+
+    const { issued } = await backfillAccessCodes("backfill test");
+    expect(issued.length).toBeGreaterThanOrEqual(3);
+
+    // Every user now has exactly one code.
+    const orphans = await db`
+      SELECT count(*)::int AS n FROM users u
+      WHERE NOT EXISTS (SELECT 1 FROM access_codes ac WHERE ac.user_id = u.id)
+    `;
+    expect(orphans[0]?.n).toBe(0);
+
+    // And a backfilled code actually works.
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: issued[0]!.code }),
+    });
+    expect(response.status).toBe(200);
+    expect((await json(response)).user.id).toBe(issued[0]!.userId);
   });
 
   test("never stores the raw code", async () => {
@@ -303,11 +375,11 @@ describe("logout", () => {
   });
 
   test("does not affect other sessions for the same user", async () => {
-    const { userId } = await createDemoUserWithCode();
-    const first = await createAccessCode(userId);
-    const second = await createAccessCode(userId);
+    // One code per user, but each login creates its own session — so logging
+    // out on one device must not sign the user out on another.
+    const { code } = await createDemoUserWithCode();
 
-    const login = async (code: string) => {
+    const login = async () => {
       const response = await fetch(`${url}/api/v1/auth/login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -316,8 +388,9 @@ describe("logout", () => {
       return (await json<{ token: string }>(response)).token;
     };
 
-    const tokenA = await login(first);
-    const tokenB = await login(second);
+    const tokenA = await login();
+    const tokenB = await login();
+    expect(tokenA).not.toBe(tokenB);
 
     await fetch(`${url}/api/v1/auth/logout`, {
       method: "POST",

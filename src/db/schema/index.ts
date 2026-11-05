@@ -44,10 +44,14 @@ export const demo_sessions = pgTable(
 );
 
 /**
- * Access codes: the only way to obtain a token.
+ * Access codes: the permanent login credential for a user.
  *
- * The raw code is shown to the operator once and never stored — only its
- * SHA-256 hash is persisted, so a database leak does not yield usable codes.
+ * One code per user, never expiring, reusable. The raw code is shown to the
+ * operator once and never stored — only its SHA-256 hash is persisted, so a
+ * database leak does not yield usable codes.
+ *
+ * `expires_at` and `redeemed_at` are retained for the legacy invitation-style
+ * flow (`ACCESS_CODE_SINGLE_USE=true`) but are `NULL` for permanent codes.
  */
 export const access_codes = pgTable(
   "access_codes",
@@ -55,20 +59,22 @@ export const access_codes = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     /** SHA-256 of the normalised code. */
     codeHash: text("code_hash").notNull(),
+    /** One code per user: this is the uniqueness constraint that enforces it. */
     userId: uuid("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     /** Free-text note for the operator, e.g. who the code was issued to. */
     label: text("label"),
-    expiresAt: timestamptz("expires_at").notNull(),
-    /** Set when redeemed; a single-use code cannot be redeemed twice. */
+    /** NULL for a permanent code. */
+    expiresAt: timestamptz("expires_at"),
+    /** Only set when `ACCESS_CODE_SINGLE_USE` is enabled. */
     redeemedAt: timestamptz("redeemed_at"),
     revokedAt: timestamptz("revoked_at"),
     createdAt: timestamptz("created_at").notNull().defaultNow(),
   },
   (table) => [
     uniqueIndex("access_codes_code_hash_idx").on(table.codeHash),
-    index("access_codes_user_id_idx").on(table.userId),
+    uniqueIndex("access_codes_user_id_idx").on(table.userId),
     index("access_codes_expires_at_idx").on(table.expiresAt),
   ],
 );

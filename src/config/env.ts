@@ -45,12 +45,15 @@ const envSchema = z.object({
    * "sign everyone out" lever.
    */
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars"),
-  /** How long an issued token stays valid. The user re-enters a code after this. */
+  /** How long an issued token stays valid. The user re-enters their code after this. */
   JWT_TTL_HOURS: int(24, 1),
-  /** When true, an access code can be redeemed exactly once. */
-  ACCESS_CODE_SINGLE_USE: bool("true"),
-  /** How long an unused access code stays redeemable. */
-  ACCESS_CODE_TTL_HOURS: int(720, 1),
+  /**
+   * Access codes are permanent credentials: one per user, never expiring, and
+   * reusable. This flag exists only as an escape hatch for a one-off
+   * invitation-style code; it defaults to off because the product model is
+   * "your code is your login".
+   */
+  ACCESS_CODE_SINGLE_USE: bool("false"),
 
   STORAGE_DRIVER: z.enum(["s3", "filesystem"]).default("s3"),
   STORAGE_FILESYSTEM_ROOT: z.string().default("./.storage"),
@@ -139,7 +142,6 @@ function parse(raw: Record<string, string | undefined>): Env {
   positives(
     env.PORT,
     env.JWT_TTL_HOURS,
-    env.ACCESS_CODE_TTL_HOURS,
     env.PRESIGNED_UPLOAD_TTL_SECONDS,
     env.PRESIGNED_DOWNLOAD_TTL_SECONDS,
     env.MAX_IMAGE_SIZE_MB,
