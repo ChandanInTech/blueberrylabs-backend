@@ -3,7 +3,7 @@ import { EnvValidationError, getEnv, resetEnvCache } from "../../src/config/env"
 
 const base = {
   DATABASE_URL: "postgresql://app:app@localhost:5432/test",
-  DEMO_SESSION_SECRET: "a".repeat(32),
+  JWT_SECRET: "a".repeat(32),
   STORAGE_DRIVER: "filesystem",
 };
 
@@ -34,8 +34,8 @@ describe("environment validation", () => {
     expect(getEnv().ALLOWED_IMAGE_TYPES).toEqual(["image/jpeg", "image/png"]);
   });
 
-  test("rejects a short session secret", () => {
-    process.env = Object.assign({}, process.env, withEnv({ DEMO_SESSION_SECRET: "short" }));
+  test("rejects a short JWT secret", () => {
+    process.env = Object.assign({}, process.env, withEnv({ JWT_SECRET: "short" }));
     resetEnvCache();
     expect(() => getEnv()).toThrow(EnvValidationError);
   });

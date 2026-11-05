@@ -43,6 +43,62 @@ export const demo_sessions = pgTable(
   ],
 );
 
+/**
+ * Access codes: the only way to obtain a token.
+ *
+ * The raw code is shown to the operator once and never stored — only its
+ * SHA-256 hash is persisted, so a database leak does not yield usable codes.
+ */
+export const access_codes = pgTable(
+  "access_codes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /** SHA-256 of the normalised code. */
+    codeHash: text("code_hash").notNull(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Free-text note for the operator, e.g. who the code was issued to. */
+    label: text("label"),
+    expiresAt: timestamptz("expires_at").notNull(),
+    /** Set when redeemed; a single-use code cannot be redeemed twice. */
+    redeemedAt: timestamptz("redeemed_at"),
+    revokedAt: timestamptz("revoked_at"),
+    createdAt: timestamptz("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("access_codes_code_hash_idx").on(table.codeHash),
+    index("access_codes_user_id_idx").on(table.userId),
+    index("access_codes_expires_at_idx").on(table.expiresAt),
+  ],
+);
+
+/**
+ * Issued tokens.
+ *
+ * A JWT cannot be withdrawn on its own, so every token carries a `jti` that
+ * points at a row here. Logout sets `revoked_at`, and the auth middleware
+ * rejects a token whose row is missing, revoked, or expired — which is what
+ * makes "log out" take effect immediately instead of at token expiry.
+ */
+export const auth_sessions = pgTable(
+  "auth_sessions",
+  {
+    /** Equals the JWT `jti`. */
+    id: uuid("id").primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    expiresAt: timestamptz("expires_at").notNull(),
+    revokedAt: timestamptz("revoked_at"),
+    createdAt: timestamptz("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    index("auth_sessions_user_id_idx").on(table.userId),
+    index("auth_sessions_expires_at_idx").on(table.expiresAt),
+  ],
+);
+
 export const assets = pgTable(
   "assets",
   {
@@ -175,6 +231,8 @@ export const generation_events = pgTable(
 
 export type UserRow = typeof users.$inferSelect;
 export type DemoSessionRow = typeof demo_sessions.$inferSelect;
+export type AccessCodeRow = typeof access_codes.$inferSelect;
+export type AuthSessionRow = typeof auth_sessions.$inferSelect;
 export type AssetRow = typeof assets.$inferSelect;
 export type GenerationRow = typeof generations.$inferSelect;
 export type JobRow = typeof jobs.$inferSelect;

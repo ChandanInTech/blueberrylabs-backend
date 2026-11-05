@@ -16,6 +16,7 @@
     "lint:fix": "biome check --write .",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun src/db/migrate.ts",
+    "auth:code": "bun src/cli/issue-access-code.ts",
     "db:studio": "drizzle-kit studio",
     "contracts:build": "bun --cwd contracts run build"
   },

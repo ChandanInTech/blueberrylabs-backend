@@ -15,6 +15,20 @@
       "when": 1793885624537,
       "tag": "0001_rate_limit_functions",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793897771097,
+      "tag": "0002_jwt_auth",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793897900000,
+      "tag": "0003_cleanup_jwt_auth",
+      "breakpoints": true
     }
   ]
 }

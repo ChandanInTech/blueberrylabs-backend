@@ -22,7 +22,7 @@ export function safeEqual(a: string, b: string): boolean {
  * database (architecture section 13.2).
  */
 export function rateLimitKey(operation: string, dimension: string, value: string): string {
-  return sha256(`${getEnv().DEMO_SESSION_SECRET}:${operation}:${dimension}:${value}`);
+  return sha256(`${getEnv().JWT_SECRET}:${operation}:${dimension}:${value}`);
 }
 
 export const MIME_EXTENSIONS: Record<string, string> = {

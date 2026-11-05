@@ -7,6 +7,7 @@ import { generations, jobs } from "../../src/db/schema";
 import { Worker } from "../../src/queue/worker";
 import { setStorageForTesting } from "../../src/services/storage";
 import { imageMetadata, makeImage } from "../fixtures";
+import type { TestSession } from "../harness";
 import { authedHeaders, bootTestRuntime, createSession, resetSingletons, truncateAll } from "../harness";
 import { setupTestDatabase, teardownTestDatabase, testDatabaseUrl } from "../setup-env";
 
@@ -64,15 +65,14 @@ async function drainQueue(maxRounds = 10): Promise<void> {
 
 /** Upload bytes the way the browser does: presigned PUT, then complete. */
 async function uploadImage(
-  cookie: string,
-  csrfToken: string,
+  session: TestSession,
   bytes: Uint8Array,
   contentType = "image/png",
   filename = "photo.png",
 ): Promise<string> {
   const createResponse = await fetch(`${url}/api/v1/uploads`, {
     method: "POST",
-    headers: { cookie, "x-csrf-token": csrfToken, "content-type": "application/json" },
+    headers: authedHeaders(session, { "content-type": "application/json" }),
     body: JSON.stringify({ filename, contentType, sizeBytes: bytes.byteLength }),
   });
   expect(createResponse.status).toBe(201);
@@ -89,7 +89,7 @@ async function uploadImage(
 
   const complete = await fetch(`${url}/api/v1/uploads/${created.assetId}/complete`, {
     method: "POST",
-    headers: { cookie, "x-csrf-token": csrfToken },
+    headers: authedHeaders(session),
   });
   expect(complete.status).toBe(200);
   expect((await json(complete)).uploadStatus).toBe("UPLOADED");
@@ -101,7 +101,7 @@ describe("end-to-end generation pipeline", () => {
   test("uploads, enqueues, processes, and exposes a signed download", async () => {
     const session = await createSession(url);
     const source = await makeImage(800, 600, { format: "png" });
-    const assetId = await uploadImage(session.cookie, session.csrfToken, source);
+    const assetId = await uploadImage(session, source);
 
     const createResponse = await fetch(`${url}/api/v1/generations`, {
       method: "POST",
@@ -119,7 +119,7 @@ describe("end-to-end generation pipeline", () => {
 
     // A queued generation must be visible immediately, before processing.
     const before = await fetch(`${url}/api/v1/generations/${created.generationId}`, {
-      headers: { cookie: session.cookie },
+      headers: authedHeaders(session),
     });
     const beforeBody = await json(before);
     expect(beforeBody.status).toBe("QUEUED");
@@ -128,7 +128,7 @@ describe("end-to-end generation pipeline", () => {
     await drainQueue();
 
     const after = await fetch(`${url}/api/v1/generations/${created.generationId}`, {
-      headers: { cookie: session.cookie },
+      headers: authedHeaders(session),
     });
     expect(after.status).toBe(200);
     const afterBody = await json(after);
@@ -169,7 +169,7 @@ describe("end-to-end generation pipeline", () => {
     ];
 
     for (const [platform, format, width, height] of presets) {
-      const assetId = await uploadImage(session.cookie, session.csrfToken, source, "image/jpeg", "photo.jpg");
+      const assetId = await uploadImage(session, source, "image/jpeg", "photo.jpg");
       const createResponse = await fetch(`${url}/api/v1/generations`, {
         method: "POST",
         headers: authedHeaders(session, { "content-type": "application/json" }),
@@ -182,7 +182,7 @@ describe("end-to-end generation pipeline", () => {
 
       const status = await json(
         await fetch(`${url}/api/v1/generations/${created.generationId}`, {
-          headers: { cookie: session.cookie },
+          headers: authedHeaders(session),
         }),
       );
       expect(status.status).toBe("COMPLETED");
@@ -203,7 +203,7 @@ describe("end-to-end generation pipeline", () => {
 
   test("the same idempotency key returns the same generation", async () => {
     const session = await createSession(url);
-    const assetId = await uploadImage(session.cookie, session.csrfToken, await makeImage(200, 200));
+    const assetId = await uploadImage(session, await makeImage(200, 200));
     const headers = {
       ...authedHeaders(session, { "content-type": "application/json" }),
       "idempotency-key": "stable-key",
@@ -226,7 +226,7 @@ describe("end-to-end generation pipeline", () => {
   test("reusing a key with a different payload conflicts", async () => {
     const session = await createSession(url);
     const source = await makeImage(200, 200);
-    const assetId = await uploadImage(session.cookie, session.csrfToken, source);
+    const assetId = await uploadImage(session, source);
 
     const headers = {
       ...authedHeaders(session, { "content-type": "application/json" }),
@@ -250,7 +250,7 @@ describe("end-to-end generation pipeline", () => {
 
   test("rejects an unsupported platform/format pair", async () => {
     const session = await createSession(url);
-    const assetId = await uploadImage(session.cookie, session.csrfToken, await makeImage(200, 200));
+    const assetId = await uploadImage(session, await makeImage(200, 200));
 
     const response = await fetch(`${url}/api/v1/generations`, {
       method: "POST",
@@ -264,7 +264,7 @@ describe("end-to-end generation pipeline", () => {
   test("rejects a generation for another user's asset", async () => {
     const alice = await createSession(url);
     const bob = await createSession(url);
-    const assetId = await uploadImage(alice.cookie, alice.csrfToken, await makeImage(200, 200));
+    const assetId = await uploadImage(alice, await makeImage(200, 200));
 
     const response = await fetch(`${url}/api/v1/generations`, {
       method: "POST",
@@ -295,8 +295,7 @@ describe("end-to-end generation pipeline", () => {
   test("a corrupt image fails the generation permanently", async () => {
     const session = await createSession(url);
     const assetId = await uploadImage(
-      session.cookie,
-      session.csrfToken,
+      session,
       new Uint8Array(Buffer.from("not an image at all")),
       "image/png",
       "broken.png",
@@ -314,7 +313,7 @@ describe("end-to-end generation pipeline", () => {
 
     const status = await json(
       await fetch(`${url}/api/v1/generations/${created.generationId}`, {
-        headers: { cookie: session.cookie },
+        headers: authedHeaders(session),
       }),
     );
     expect(status.status).toBe("FAILED");
@@ -327,7 +326,7 @@ describe("end-to-end generation pipeline", () => {
 
   test("job is durable across a simulated process restart", async () => {
     const session = await createSession(url);
-    const assetId = await uploadImage(session.cookie, session.csrfToken, await makeImage(300, 300));
+    const assetId = await uploadImage(session, await makeImage(300, 300));
     const created = await json<{ generationId: string }>(
       await fetch(`${url}/api/v1/generations`, {
         method: "POST",
@@ -347,7 +346,7 @@ describe("end-to-end generation pipeline", () => {
 
     const status = await json(
       await fetch(`${url}/api/v1/generations/${created.generationId}`, {
-        headers: { cookie: session.cookie },
+        headers: authedHeaders(session),
       }),
     );
     expect(status.status).toBe("COMPLETED");
@@ -355,7 +354,7 @@ describe("end-to-end generation pipeline", () => {
 
   test("a redelivered job does not create a second output asset", async () => {
     const session = await createSession(url);
-    const assetId = await uploadImage(session.cookie, session.csrfToken, await makeImage(300, 300));
+    const assetId = await uploadImage(session, await makeImage(300, 300));
     const created = await json<{ generationId: string }>(
       await fetch(`${url}/api/v1/generations`, {
         method: "POST",
@@ -393,7 +392,7 @@ describe("end-to-end generation pipeline", () => {
     const source = await makeImage(120, 120);
 
     for (let i = 0; i < 3; i += 1) {
-      const assetId = await uploadImage(session.cookie, session.csrfToken, source);
+      const assetId = await uploadImage(session, source);
       await fetch(`${url}/api/v1/generations`, {
         method: "POST",
         headers: authedHeaders(session, { "content-type": "application/json" }),
@@ -402,14 +401,14 @@ describe("end-to-end generation pipeline", () => {
     }
 
     const page1 = await json<{ items: any[]; nextCursor: string | null }>(
-      await fetch(`${url}/api/v1/generations?limit=2`, { headers: { cookie: session.cookie } }),
+      await fetch(`${url}/api/v1/generations?limit=2`, { headers: authedHeaders(session) }),
     );
     expect(page1.items).toHaveLength(2);
     expect(page1.nextCursor).toBeString();
 
     const page2 = await json<{ items: any[]; nextCursor: string | null }>(
       await fetch(`${url}/api/v1/generations?limit=2&cursor=${encodeURIComponent(page1.nextCursor!)}`, {
-        headers: { cookie: session.cookie },
+        headers: authedHeaders(session),
       }),
     );
     expect(page2.items).toHaveLength(1);

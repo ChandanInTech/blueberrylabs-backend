@@ -3,7 +3,7 @@ import { EnvValidationError, getEnv, resetEnvCache } from "../../src/config/env"
 
 const base = {
   DATABASE_URL: "postgresql://app:app@localhost:5432/test",
-  DEMO_SESSION_SECRET: "a".repeat(32),
+  JWT_SECRET: "a".repeat(32),
   STORAGE_DRIVER: "s3",
   RAILWAY_BUCKET_ENDPOINT: "https://t3.storageapi.dev",
 };
@@ -11,7 +11,7 @@ const base = {
 /** Every key this suite touches, so one test cannot leak into the next. */
 const MANAGED_KEYS = [
   "DATABASE_URL",
-  "DEMO_SESSION_SECRET",
+  "JWT_SECRET",
   "STORAGE_DRIVER",
   "RAILWAY_BUCKET_ENDPOINT",
   "RAILWAY_BUCKET_REGION",

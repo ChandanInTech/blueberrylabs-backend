@@ -48,7 +48,7 @@ export async function teardownTestDatabase(): Promise<void> {
 export function applyTestEnv(): void {
   process.env.NODE_ENV = "test";
   process.env.DATABASE_URL = testDatabaseUrl();
-  process.env.DEMO_SESSION_SECRET = "test-secret-value-at-least-16-chars-long";
+  process.env.JWT_SECRET = "test-jwt-secret-value-at-least-32-chars-long";
   process.env.STORAGE_DRIVER = "filesystem";
   process.env.STORAGE_FILESYSTEM_ROOT = `/tmp/blueberry-test-storage-${process.pid}`;
   process.env.API_PUBLIC_URL = "http://localhost:3001";

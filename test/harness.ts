@@ -5,37 +5,38 @@ import { setStorageForTesting } from "../src/services/storage";
 import { applyTestEnv } from "./setup-env";
 
 export interface TestSession {
-  cookie: string;
-  csrfToken: string;
+  token: string;
   userId: string;
 }
 
 /**
- * Minimal browser stand-in for cookie handling.
+ * Create a user, an access code, and a token — the same path a real user takes.
  *
- * Bun's `fetch` has no cookie jar, so tests carry the session cookie and the
- * CSRF token the way the frontend does.
+ * Tests go through `/auth/login` rather than minting a token directly so the
+ * code-redemption path is exercised by every suite that needs a session.
  */
 export async function createSession(baseUrl: string): Promise<TestSession> {
-  const response = await fetch(`${baseUrl}/api/v1/auth/demo`, { method: "POST" });
-  if (response.status !== 201) {
-    throw new Error(`Failed to create demo session: ${response.status} ${await response.text()}`);
+  const { createDemoUserWithCode } = await import("../src/modules/auth/session");
+  const { code, userId } = await createDemoUserWithCode("test");
+
+  const response = await fetch(`${baseUrl}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+
+  if (response.status !== 200) {
+    throw new Error(`Failed to log in with access code: ${response.status} ${await response.text()}`);
   }
 
-  const setCookies = response.headers.getSetCookie();
-  const cookie = setCookies
-    .map((entry) => entry.split(";")[0])
-    .filter(Boolean)
-    .join("; ");
-  const body = (await response.json()) as { csrfToken: string; user: { id: string } };
-
-  return { cookie, csrfToken: body.csrfToken, userId: body.user.id };
+  const body = (await response.json()) as { token: string; user: { id: string } };
+  return { token: body.token, userId: body.user.id ?? userId };
 }
 
+/** Headers that authenticate a request. */
 export function authedHeaders(session: TestSession, extra: Record<string, string> = {}) {
   return {
-    cookie: session.cookie,
-    "x-csrf-token": session.csrfToken,
+    authorization: `Bearer ${session.token}`,
     ...extra,
   };
 }
@@ -58,6 +59,6 @@ export function bootTestRuntime(): void {
 export async function truncateAll(): Promise<void> {
   const db = getDatabase().client;
   await db.unsafe(
-    "TRUNCATE generation_events, jobs, generations, assets, demo_sessions, rate_limit_buckets, users RESTART IDENTITY CASCADE",
+    "TRUNCATE generation_events, jobs, generations, assets, auth_sessions, access_codes, demo_sessions, rate_limit_buckets, users RESTART IDENTITY CASCADE",
   );
 }

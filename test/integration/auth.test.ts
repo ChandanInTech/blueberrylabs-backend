@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createApp } from "../../src/app";
 import * as envModule from "../../src/config/env";
 import { getDatabase } from "../../src/db/client";
+import { createAccessCode, createDemoUserWithCode, hashCode } from "../../src/modules/auth/session";
 import { setStorageForTesting } from "../../src/services/storage";
 import { authedHeaders, bootTestRuntime, createSession, resetSingletons, truncateAll } from "../harness";
 import { setupTestDatabase, teardownTestDatabase, testDatabaseUrl } from "../setup-env";
@@ -35,54 +36,171 @@ afterAll(async () => {
   await teardownTestDatabase();
 }, 30_000);
 
-describe("demo authentication", () => {
-  test("creates a session and sets HttpOnly cookies", async () => {
-    const response = await fetch(`${url}/api/v1/auth/demo`, { method: "POST" });
-    expect(response.status).toBe(201);
+describe("access-code login", () => {
+  test("exchanges a valid code for a JWT", async () => {
+    const { code, userId } = await createDemoUserWithCode("login test");
 
-    const cookies = response.headers.getSetCookie();
-    const sessionCookie = cookies.find((c) => c.startsWith("bl_session="));
-    const csrfCookie = cookies.find((c) => c.startsWith("bl_csrf="));
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
 
-    expect(sessionCookie).toBeDefined();
-    expect(sessionCookie).toContain("HttpOnly");
-    expect(sessionCookie).toContain("SameSite=Lax");
-    expect(csrfCookie).toBeDefined();
-    // CSRF token must be readable by JS for the double-submit pattern.
-    expect(csrfCookie).not.toContain("HttpOnly");
+    expect(response.status).toBe(200);
+    const body = await json(response);
+
+    expect(body.user.id).toBe(userId);
+    expect(body.user.kind).toBe("DEMO");
+    expect(typeof body.token).toBe("string");
+    // Three base64url segments: header.payload.signature.
+    expect(body.token.split(".")).toHaveLength(3);
+    expect(new Date(body.expiresAt).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  test("issues a token valid for the configured TTL (24h by default)", async () => {
+    const { code } = await createDemoUserWithCode();
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
 
     const body = await json(response);
-    expect(body.user.kind).toBe("DEMO");
-    expect(typeof body.user.id).toBe("string");
-    expect(typeof body.csrfToken).toBe("string");
+    const ttlMs = new Date(body.expiresAt).getTime() - Date.now();
+    // Allow a minute of slack for the round trip.
+    expect(ttlMs).toBeGreaterThan(23.9 * 3600 * 1000);
+    expect(ttlMs).toBeLessThanOrEqual(24 * 3600 * 1000);
   });
 
-  test("never stores the raw session token", async () => {
-    const response = await fetch(`${url}/api/v1/auth/demo`, { method: "POST" });
-    const rawCookie = response.headers
-      .getSetCookie()
-      .find((c) => c.startsWith("bl_session="))!
-      .split(";")[0]!
-      .split("=")[1]!;
+  test("accepts a code typed with separators and lower case", async () => {
+    const { code } = await createDemoUserWithCode();
+    const messy = code.toLowerCase().split("").join("-");
 
-    const rows = await getDatabase().client`SELECT token_hash FROM demo_sessions`;
-    const hashes = rows.map((row) => row.token_hash as string);
-    expect(hashes).not.toContain(rawCookie);
-    expect(hashes.some((hash) => /^[0-9a-f]{64}$/.test(hash))).toBe(true);
-  });
-
-  test("returns the current session", async () => {
-    const session = await createSession(url);
-    const response = await fetch(`${url}/api/v1/auth/session`, {
-      headers: { cookie: session.cookie },
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: messy }),
     });
+
+    expect(response.status).toBe(200);
+  });
+
+  test("rejects an unknown code", async () => {
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "ZZZZZZZZZZ" }),
+    });
+
+    expect(response.status).toBe(401);
+    expect((await json(response)).error.code).toBe("UNAUTHENTICATED");
+  });
+
+  test("rejects an expired code", async () => {
+    const { userId } = await createDemoUserWithCode();
+    const code = await createAccessCode(userId, "expired");
+    await getDatabase().client`
+      UPDATE access_codes SET expires_at = now() - interval '1 hour' WHERE code_hash = ${hashCode(code)}
+    `;
+
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+
+    expect(response.status).toBe(401);
+    expect((await json(response)).error.message).toContain("expired");
+  });
+
+  test("rejects a revoked code", async () => {
+    const { userId } = await createDemoUserWithCode();
+    const code = await createAccessCode(userId, "revoked");
+    await getDatabase().client`
+      UPDATE access_codes SET revoked_at = now() WHERE code_hash = ${hashCode(code)}
+    `;
+
+    const response = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+
+    expect(response.status).toBe(401);
+    expect((await json(response)).error.message).toContain("revoked");
+  });
+
+  test("a single-use code cannot be redeemed twice", async () => {
+    const { code } = await createDemoUserWithCode();
+
+    const first = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await fetch(`${url}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    expect(second.status).toBe(401);
+    expect((await json(second)).error.message).toContain("already been used");
+  });
+
+  test("concurrent redemptions of one code yield exactly one token", async () => {
+    const { code } = await createDemoUserWithCode();
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        fetch(`${url}/api/v1/auth/login`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ code }),
+        }),
+      ),
+    );
+
+    expect(responses.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(responses.filter((r) => r.status === 401)).toHaveLength(7);
+  });
+
+  test("never stores the raw code", async () => {
+    const { code } = await createDemoUserWithCode();
+    const rows = await getDatabase().client`SELECT code_hash FROM access_codes`;
+    const hashes = rows.map((row) => row.code_hash as string);
+
+    expect(hashes).not.toContain(code);
+    expect(hashes).toContain(hashCode(code));
+    expect(hashes.every((hash) => /^[0-9a-f]{64}$/.test(hash))).toBe(true);
+  });
+
+  test("rejects a missing or too-short code at the schema layer", async () => {
+    for (const body of [{}, { code: "" }, { code: "ab" }]) {
+      const response = await fetch(`${url}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+      expect((await json(response)).error.code).toBe("VALIDATION_ERROR");
+    }
+  });
+});
+
+describe("bearer token authentication", () => {
+  test("returns the current session for a valid token", async () => {
+    const session = await createSession(url);
+    const response = await fetch(`${url}/api/v1/auth/session`, { headers: authedHeaders(session) });
+
     expect(response.status).toBe(200);
     const body = await json(response);
     expect(body.user.id).toBe(session.userId);
-    expect(body.csrfToken).toBe(session.csrfToken);
+    expect(body.token).toBe(session.token);
   });
 
-  test("rejects an unauthenticated session read", async () => {
+  test("rejects a request with no Authorization header", async () => {
     const response = await fetch(`${url}/api/v1/auth/session`);
     expect(response.status).toBe(401);
     const body = await json(response);
@@ -90,31 +208,135 @@ describe("demo authentication", () => {
     expect(body.error.requestId).toBeString();
   });
 
-  test("logout revokes the session and clears cookies", async () => {
+  test("rejects a malformed Authorization header", async () => {
+    for (const header of ["", "Bearer", "Bearer ", "Basic abc", "token abc", "Bearer  "]) {
+      const response = await fetch(`${url}/api/v1/auth/session`, {
+        headers: { authorization: header },
+      });
+      expect(response.status).toBe(401);
+    }
+  });
+
+  test("rejects a forged token", async () => {
+    const response = await fetch(`${url}/api/v1/auth/session`, {
+      headers: { authorization: "Bearer forged.token.value" },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects a token whose signature was tampered with", async () => {
     const session = await createSession(url);
-    const response = await fetch(`${url}/api/v1/auth/logout`, {
+    const [header, payload, signature] = session.token.split(".");
+    // Flip the last character of the signature.
+    const flipped = signature!.slice(0, -1) + (signature!.endsWith("A") ? "B" : "A");
+
+    const response = await fetch(`${url}/api/v1/auth/session`, {
+      headers: { authorization: `Bearer ${header}.${payload}.${flipped}` },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects a token signed with the wrong secret", async () => {
+    const { signAccessToken } = await import("../../src/modules/auth/jwt");
+    const { token } = signAccessToken({ sub: "someone", jti: crypto.randomUUID() }, "x".repeat(48), 3600);
+
+    const response = await fetch(`${url}/api/v1/auth/session`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects an expired token even with a valid signature", async () => {
+    const { signAccessToken } = await import("../../src/modules/auth/jwt");
+    const session = await createSession(url);
+    const { token } = signAccessToken(
+      { sub: session.userId, jti: crypto.randomUUID() },
+      process.env.JWT_SECRET!,
+      0,
+    );
+
+    const response = await fetch(`${url}/api/v1/auth/session`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  test("rejects a valid token whose session row was deleted", async () => {
+    const session = await createSession(url);
+    await getDatabase().client`DELETE FROM auth_sessions`;
+
+    const response = await fetch(`${url}/api/v1/auth/session`, { headers: authedHeaders(session) });
+    expect(response.status).toBe(401);
+  });
+
+  test("protected routes reject a missing token", async () => {
+    for (const path of ["/api/v1/generations", "/api/v1/assets/00000000-0000-4000-8000-000000000001"]) {
+      const response = await fetch(`${url}${path}`);
+      expect(response.status).toBe(401);
+    }
+  });
+
+  test("protected routes reject a forged token", async () => {
+    const response = await fetch(`${url}/api/v1/generations`, {
+      headers: { authorization: "Bearer not-a-real-token" },
+    });
+    expect(response.status).toBe(401);
+  });
+});
+
+describe("logout", () => {
+  test("revokes the token immediately", async () => {
+    const session = await createSession(url);
+
+    const before = await fetch(`${url}/api/v1/auth/session`, { headers: authedHeaders(session) });
+    expect(before.status).toBe(200);
+
+    const logout = await fetch(`${url}/api/v1/auth/logout`, {
       method: "POST",
       headers: authedHeaders(session),
     });
-    expect(response.status).toBe(204);
+    expect(logout.status).toBe(204);
 
-    const cleared = response.headers.getSetCookie();
-    expect(cleared.some((c) => c.startsWith("bl_session=;"))).toBe(true);
-
-    const after = await fetch(`${url}/api/v1/auth/session`, { headers: { cookie: session.cookie } });
+    // The token is still cryptographically valid but must no longer be accepted.
+    const after = await fetch(`${url}/api/v1/auth/session`, { headers: authedHeaders(session) });
     expect(after.status).toBe(401);
   });
 
-  test("logout without a CSRF token is rejected", async () => {
-    const session = await createSession(url);
-    const response = await fetch(`${url}/api/v1/auth/logout`, {
+  test("does not affect other sessions for the same user", async () => {
+    const { userId } = await createDemoUserWithCode();
+    const first = await createAccessCode(userId);
+    const second = await createAccessCode(userId);
+
+    const login = async (code: string) => {
+      const response = await fetch(`${url}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      return (await json<{ token: string }>(response)).token;
+    };
+
+    const tokenA = await login(first);
+    const tokenB = await login(second);
+
+    await fetch(`${url}/api/v1/auth/logout`, {
       method: "POST",
-      headers: { cookie: session.cookie },
+      headers: { authorization: `Bearer ${tokenA}` },
     });
-    expect(response.status).toBe(403);
-    expect((await json<{ error: { code: string } }>(response)).error.code).toBe("CSRF_TOKEN_INVALID");
+
+    const stillValid = await fetch(`${url}/api/v1/auth/session`, {
+      headers: { authorization: `Bearer ${tokenB}` },
+    });
+    expect(stillValid.status).toBe(200);
   });
 
+  test("logout without a token is rejected", async () => {
+    const response = await fetch(`${url}/api/v1/auth/logout`, { method: "POST" });
+    expect(response.status).toBe(401);
+  });
+});
+
+describe("origin allow-list", () => {
   test("rejects requests from a disallowed origin", async () => {
     const session = await createSession(url);
     const response = await fetch(`${url}/api/v1/auth/logout`, {
@@ -132,13 +354,6 @@ describe("demo authentication", () => {
       headers: { ...authedHeaders(session), origin: "http://localhost:3000" },
     });
     expect(response.status).toBe(204);
-  });
-
-  test("a forged session cookie is rejected", async () => {
-    const response = await fetch(`${url}/api/v1/auth/session`, {
-      headers: { cookie: "bl_session=forged-token-value; bl_csrf=whatever" },
-    });
-    expect(response.status).toBe(401);
   });
 
   test("echoes the correlation id header", async () => {
@@ -174,10 +389,7 @@ describe("rate limiting", () => {
     envModule.resetEnvCache();
   });
 
-  test("returns 429 with Retry-After once the demo-auth limit is hit", async () => {
-    // Limit is 10 per 15 minutes per IP; each test request has no proxy IP, so
-    // the limiter keys on nothing and allows. Force a user-scoped limit instead
-    // by hammering the generation endpoint with a real session.
+  test("returns 429 with Retry-After once the generation limit is hit", async () => {
     const session = await createSession(url);
 
     const statuses: number[] = [];
@@ -224,16 +436,9 @@ describe("ownership isolation", () => {
     expect(alice.userId).not.toBe(bob.userId);
 
     const response = await fetch(`${url}/api/v1/generations/00000000-0000-4000-8000-000000000001`, {
-      headers: { cookie: bob.cookie },
+      headers: authedHeaders(bob),
     });
     expect(response.status).toBe(404);
-  });
-
-  test("protected routes reject missing sessions", async () => {
-    for (const path of ["/api/v1/generations", "/api/v1/assets/00000000-0000-4000-8000-000000000001"]) {
-      const response = await fetch(`${url}${path}`);
-      expect(response.status).toBe(401);
-    }
   });
 });
 

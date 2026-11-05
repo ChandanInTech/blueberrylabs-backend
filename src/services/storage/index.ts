@@ -19,7 +19,7 @@ export function getStorage(): StorageService {
     cached = new FilesystemStorage(
       env.STORAGE_FILESYSTEM_ROOT,
       { originals: env.RAILWAY_BUCKET_ORIGINALS, generated: env.RAILWAY_BUCKET_GENERATED },
-      env.DEMO_SESSION_SECRET,
+      env.JWT_SECRET,
       env.API_PUBLIC_URL,
       env.ALLOWED_IMAGE_TYPES,
     );

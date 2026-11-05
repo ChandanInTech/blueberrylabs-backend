@@ -1,165 +1,165 @@
-import { eq, lt } from "drizzle-orm";
+import { and, eq, isNull, lt } from "drizzle-orm";
 import { getEnv } from "../../config/env";
 import { getDb } from "../../db/client";
-import { demo_sessions, users } from "../../db/schema";
+import { access_codes, auth_sessions, users } from "../../db/schema";
 import type { ScopedLogger } from "../../observability/logger";
-import { hmacSha256, safeEqual, sha256 } from "../../utils/crypto";
+import { sha256 } from "../../utils/crypto";
 import { errors } from "../../utils/errors";
-import { randomToken } from "../../utils/ids";
+import { randomToken, uuid } from "../../utils/ids";
+import { signAccessToken, verifyAccessToken } from "./jwt";
 
-export const SESSION_COOKIE = "bl_session";
-export const CSRF_COOKIE = "bl_csrf";
-
+/** The authenticated caller, resolved from a bearer token. */
 export interface SessionPrincipal {
-  sessionId: string;
   userId: string;
-  csrfTokenHash: string;
+  /** The `auth_sessions` row id, equal to the token's `jti`. */
+  sessionId: string;
   expiresAt: Date;
 }
 
-export interface IssuedSession extends SessionPrincipal {
+export interface IssuedSession {
   token: string;
-  csrfToken: string;
-}
-
-function cookieSecure(): boolean {
-  const env = getEnv();
-  if (env.COOKIE_SECURE === "auto") return env.NODE_ENV === "production";
-  return env.COOKIE_SECURE === "true";
-}
-
-export function sessionCookie(token: string, maxAgeSeconds: number): string {
-  const attributes = [
-    `${SESSION_COOKIE}=${token}`,
-    "Path=/",
-    "HttpOnly",
-    "SameSite=Lax",
-    `Max-Age=${maxAgeSeconds}`,
-  ];
-  if (cookieSecure()) attributes.push("Secure");
-  return attributes.join("; ");
+  expiresAt: Date;
+  userId: string;
 }
 
 /**
- * The CSRF token is intentionally readable by JavaScript (double-submit
- * pattern) but still SameSite=Lax and short-lived so it cannot be replayed
- * cross-origin.
- */
-export function csrfCookie(token: string, maxAgeSeconds: number): string {
-  const attributes = [`${CSRF_COOKIE}=${token}`, "Path=/", "SameSite=Lax", `Max-Age=${maxAgeSeconds}`];
-  if (cookieSecure()) attributes.push("Secure");
-  return attributes.join("; ");
-}
-
-export function clearSessionCookies(): string[] {
-  return [
-    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSecure() ? "; Secure" : ""}`,
-    `${CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0${cookieSecure() ? "; Secure" : ""}`,
-  ];
-}
-
-export function parseCookies(header: string | null | undefined): Record<string, string> {
-  if (!header) return {};
-  const out: Record<string, string> = {};
-  for (const part of header.split(";")) {
-    const index = part.indexOf("=");
-    if (index <= 0) continue;
-    const key = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
-    if (key) out[key] = decodeURIComponent(value);
-  }
-  return out;
-}
-
-/**
- * Create a demo principal and session.
+ * Canonical form of an access code.
  *
- * The architecture allows either a shared demo principal or per-visitor
- * principals; this uses a fresh principal per demo login so ownership checks
- * are meaningful (cross-user access tests need two distinct users) while still
- * requiring no signup.
+ * Codes are shown grouped (`ABCD-EFGH`) but typed however the user likes, so
+ * separators are stripped and case is folded before hashing. Without this the
+ * same code would hash differently depending on how it was typed.
  */
-export async function createDemoSession(log: ScopedLogger): Promise<IssuedSession> {
-  const db = getDb();
+export function normaliseCode(code: string): string {
+  return code.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+}
+
+/** Hash a normalised code for storage and lookup. */
+export function hashCode(code: string): string {
+  return sha256(normaliseCode(code));
+}
+
+/**
+ * Exchange an access code for a signed token.
+ *
+ * Runs in one transaction so a single-use code cannot be redeemed twice by two
+ * concurrent requests: the `UPDATE ... WHERE redeemed_at IS NULL` both claims
+ * the code and tells us whether we won the race.
+ */
+export async function loginWithCode(code: string, log: ScopedLogger): Promise<IssuedSession> {
   const env = getEnv();
-  const token = randomToken(32);
-  const csrfToken = randomToken(24);
-  const expiresAt = new Date(Date.now() + env.DEMO_SESSION_TTL_HOURS * 60 * 60 * 1000);
+  const codeHash = hashCode(code);
 
-  const session = await db.transaction(async (tx) => {
-    const [user] = await tx.insert(users).values({ kind: "DEMO" }).returning();
-    if (!user) throw errors.internal(new Error("demo user insert returned no row"));
+  const issued = await getDb().transaction(async (tx) => {
+    const [row] = await tx.select().from(access_codes).where(eq(access_codes.codeHash, codeHash)).limit(1);
 
-    const [row] = await tx
-      .insert(demo_sessions)
-      .values({
-        userId: user.id,
-        tokenHash: sha256(token),
-        csrfTokenHash: hmacSha256(env.DEMO_SESSION_SECRET, csrfToken),
-        expiresAt,
-      })
-      .returning();
+    if (!row) throw errors.unauthenticated("That access code is not valid.");
+    if (row.revokedAt !== null) throw errors.unauthenticated("That access code has been revoked.");
+    if (row.expiresAt.getTime() <= Date.now()) throw errors.unauthenticated("That access code has expired.");
 
-    if (!row) throw errors.internal(new Error("demo session insert returned no row"));
-    return row;
+    if (env.ACCESS_CODE_SINGLE_USE) {
+      const claimed = await tx
+        .update(access_codes)
+        .set({ redeemedAt: new Date() })
+        .where(and(eq(access_codes.id, row.id), isNull(access_codes.redeemedAt)))
+        .returning({ id: access_codes.id });
+
+      if (claimed.length === 0) {
+        throw errors.unauthenticated("That access code has already been used.");
+      }
+    }
+
+    const sessionId = uuid();
+    const { token, expiresAt } = signAccessToken(
+      { sub: row.userId, jti: sessionId },
+      env.JWT_SECRET,
+      env.JWT_TTL_HOURS * 3600,
+    );
+
+    await tx.insert(auth_sessions).values({ id: sessionId, userId: row.userId, expiresAt });
+
+    return { token, expiresAt, userId: row.userId, sessionId };
   });
 
-  log.info("auth.demo_session.created", { userId: session.userId, sessionId: session.id });
+  log.info("auth.login", { userId: issued.userId, sessionId: issued.sessionId });
 
-  return {
-    sessionId: session.id,
-    userId: session.userId,
-    csrfTokenHash: session.csrfTokenHash,
-    expiresAt: session.expiresAt,
-    token,
-    csrfToken,
-  };
-}
-
-/** Validate a raw session token. Returns `null` when the session is unusable. */
-export async function findSessionByToken(token: string | undefined): Promise<SessionPrincipal | null> {
-  if (!token) return null;
-  const db = getDb();
-  const [row] = await db
-    .select()
-    .from(demo_sessions)
-    .where(eq(demo_sessions.tokenHash, sha256(token)))
-    .limit(1);
-
-  if (!row) return null;
-  if (row.revokedAt !== null) return null;
-  if (row.expiresAt.getTime() <= Date.now()) return null;
-
-  return {
-    sessionId: row.id,
-    userId: row.userId,
-    csrfTokenHash: row.csrfTokenHash,
-    expiresAt: row.expiresAt,
-  };
-}
-
-export async function revokeSession(sessionId: string): Promise<void> {
-  await getDb().update(demo_sessions).set({ revokedAt: new Date() }).where(eq(demo_sessions.id, sessionId));
+  return { token: issued.token, expiresAt: issued.expiresAt, userId: issued.userId };
 }
 
 /**
- * Validate the double-submit CSRF token.
+ * Resolve a bearer token to a principal.
  *
- * The raw CSRF token lives only in the readable `bl_csrf` cookie; we compare
- * it against the hash bound to the session server-side, so a forged cookie
- * alone is useless.
+ * Two independent checks, both required:
+ *   1. the signature and `exp` claim (stateless, no database round trip);
+ *   2. the `auth_sessions` row (stateful, so logout and revocation are
+ *      immediate rather than deferred to token expiry).
+ *
+ * Returns `null` for any failure so callers cannot accidentally treat a
+ * partially-valid token as authenticated.
  */
-export function verifyCsrf(principal: SessionPrincipal, headerToken: string | undefined): boolean {
-  if (!headerToken) return false;
-  const derived = hmacSha256(getEnv().DEMO_SESSION_SECRET, headerToken);
-  return safeEqual(derived, principal.csrfTokenHash);
+export async function authenticate(token: string | undefined): Promise<SessionPrincipal | null> {
+  if (!token) return null;
+
+  const claims = verifyAccessToken(token, getEnv().JWT_SECRET);
+  if (!claims) return null;
+
+  const [session] = await getDb()
+    .select()
+    .from(auth_sessions)
+    .where(and(eq(auth_sessions.id, claims.jti), isNull(auth_sessions.revokedAt)))
+    .limit(1);
+
+  if (!session) return null;
+  if (session.expiresAt.getTime() <= Date.now()) return null;
+  // The token's subject must match the session owner; a mismatch means the
+  // token was minted against a different row and is not trustworthy.
+  if (session.userId !== claims.sub) return null;
+
+  return { userId: session.userId, sessionId: session.id, expiresAt: session.expiresAt };
 }
 
-/** Remove sessions that are long expired. Called by the cleanup task. */
+/** Revoke one session. Idempotent: revoking twice is not an error. */
+export async function revokeSession(sessionId: string): Promise<void> {
+  await getDb()
+    .update(auth_sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(auth_sessions.id, sessionId), isNull(auth_sessions.revokedAt)));
+}
+
+/**
+ * Create an access code for a user.
+ *
+ * The raw code is returned exactly once and never persisted; only its hash is
+ * stored. Callers must show it to the operator immediately.
+ */
+export async function createAccessCode(userId: string, label?: string): Promise<string> {
+  const env = getEnv();
+  // 9 random bytes -> 12 base64url chars; strip to 10 alphanumerics for typing.
+  const code = normaliseCode(randomToken(9)).slice(0, 10);
+
+  await getDb()
+    .insert(access_codes)
+    .values({
+      codeHash: hashCode(code),
+      userId,
+      label: label ?? null,
+      expiresAt: new Date(Date.now() + env.ACCESS_CODE_TTL_HOURS * 3600 * 1000),
+    });
+
+  return code;
+}
+
+/** Create a demo user and an access code for it in one step. */
+export async function createDemoUserWithCode(label?: string): Promise<{ userId: string; code: string }> {
+  const [user] = await getDb().insert(users).values({ kind: "DEMO" }).returning();
+  if (!user) throw errors.internal(new Error("demo user insert returned no row"));
+  return { userId: user.id, code: await createAccessCode(user.id, label) };
+}
+
+/** Remove sessions that expired before `olderThan`. Called by the cleanup task. */
 export async function deleteExpiredSessions(olderThan: Date): Promise<number> {
   const deleted = await getDb()
-    .delete(demo_sessions)
-    .where(lt(demo_sessions.expiresAt, olderThan))
-    .returning({ id: demo_sessions.id });
+    .delete(auth_sessions)
+    .where(lt(auth_sessions.expiresAt, olderThan))
+    .returning({ id: auth_sessions.id });
   return deleted.length;
 }

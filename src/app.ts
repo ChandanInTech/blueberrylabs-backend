@@ -71,7 +71,7 @@ export function createApp() {
           },
           credentials: true,
           methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-          allowedHeaders: ["Content-Type", "X-CSRF-Token", "Idempotency-Key", "X-Request-Id"],
+          allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Request-Id"],
           exposeHeaders: ["X-Request-Id", "RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"],
           maxAge: 600,
         }),

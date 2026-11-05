@@ -39,21 +39,18 @@ const envSchema = z.object({
   WEB_ORIGIN: z.string().min(1).default("http://localhost:3000"),
   API_PUBLIC_URL: z.string().min(1).default("http://localhost:3001"),
 
-  DEMO_SESSION_SECRET: z.string().min(16, "DEMO_SESSION_SECRET must be at least 16 chars"),
-  DEMO_SESSION_TTL_HOURS: int(24, 1),
-  /** When true, cookies are marked Secure. Defaults to on in production. */
-  COOKIE_SECURE: z.enum(["true", "false", "auto"]).default("auto"),
   /**
-   * Cookie SameSite policy.
-   *
-   * `lax` is the safe default and works when the frontend and API share a
-   * site. When they are on different registrable domains (for example
-   * `*.vercel.app` calling `*.up.railway.app`), the browser treats every
-   * request as cross-site and `lax` cookies are never sent — the session
-   * silently disappears. `none` is required there, and browsers only accept
-   * `SameSite=None` together with `Secure`.
+   * HS256 signing key for access tokens. Generate with `openssl rand -base64 48`.
+   * Rotating it invalidates every issued token, which is the intended
+   * "sign everyone out" lever.
    */
-  COOKIE_SAME_SITE: z.enum(["lax", "strict", "none"]).default("lax"),
+  JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars"),
+  /** How long an issued token stays valid. The user re-enters a code after this. */
+  JWT_TTL_HOURS: int(24, 1),
+  /** When true, an access code can be redeemed exactly once. */
+  ACCESS_CODE_SINGLE_USE: bool("true"),
+  /** How long an unused access code stays redeemable. */
+  ACCESS_CODE_TTL_HOURS: int(720, 1),
 
   STORAGE_DRIVER: z.enum(["s3", "filesystem"]).default("s3"),
   STORAGE_FILESYSTEM_ROOT: z.string().default("./.storage"),
@@ -141,7 +138,8 @@ function parse(raw: Record<string, string | undefined>): Env {
   const env = result.data;
   positives(
     env.PORT,
-    env.DEMO_SESSION_TTL_HOURS,
+    env.JWT_TTL_HOURS,
+    env.ACCESS_CODE_TTL_HOURS,
     env.PRESIGNED_UPLOAD_TTL_SECONDS,
     env.PRESIGNED_DOWNLOAD_TTL_SECONDS,
     env.MAX_IMAGE_SIZE_MB,

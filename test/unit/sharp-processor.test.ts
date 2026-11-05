@@ -6,7 +6,7 @@ import { imageMetadata, makeImage } from "../fixtures";
 // The processor reads env for limits; give it a valid, self-contained config.
 beforeAll(() => {
   process.env.DATABASE_URL ??= "postgresql://app:app@localhost:5432/test";
-  process.env.DEMO_SESSION_SECRET ??= "a".repeat(32);
+  process.env.JWT_SECRET ??= "a".repeat(32);
   process.env.STORAGE_DRIVER ??= "filesystem";
 });
 

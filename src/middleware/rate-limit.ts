@@ -122,7 +122,7 @@ export function rules() {
   const env = getEnv();
   return {
     demoAuth: {
-      operation: "auth.demo",
+      operation: "auth.login",
       limit: env.RATE_LIMIT_DEMO_AUTH,
       windowSeconds: env.RATE_LIMIT_DEMO_AUTH_WINDOW_MINUTES * 60,
       dimensions: ["ip"],
