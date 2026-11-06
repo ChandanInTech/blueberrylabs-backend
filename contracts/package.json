@@ -1,6 +1,6 @@
 {
   "name": "@social-resizer/contracts",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shared API contracts and image presets for the AI-powered social media image resizer",
   "type": "module",
   "main": "./dist/index.js",

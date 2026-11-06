@@ -30,8 +30,6 @@ const REDACTED_KEYS = new Set([
   "cookie",
   "set-cookie",
   "authorization",
-  "csrfToken",
-  "csrf_token",
   "token",
   "tokenHash",
   "uploadUrl",

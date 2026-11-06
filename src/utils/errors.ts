@@ -36,7 +36,6 @@ export const errors = {
   validation: (message = "The request could not be validated.") =>
     new AppError("VALIDATION_ERROR", 400, message),
   invalidOrigin: () => new AppError("INVALID_ORIGIN", 403, "Request origin is not allowed."),
-  csrf: () => new AppError("CSRF_TOKEN_INVALID", 403, "CSRF token is missing or invalid."),
   rateLimit: (retryAfterSeconds: number, message = "Too many requests. Please try again shortly.") =>
     new AppError("RATE_LIMIT_EXCEEDED", 429, message, { retryAfterSeconds }),
   quota: (message = "You have reached the daily generation limit.") =>

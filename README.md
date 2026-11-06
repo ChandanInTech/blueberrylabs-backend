@@ -30,13 +30,13 @@ src/
 │   ├── migrations/             checked-in SQL (0000 schema, 0001 rate-limit SQL functions)
 │   └── migrate.ts              controlled migration runner
 ├── middleware/
-│   ├── auth.ts                 session + CSRF resolution
+│   ├── auth.ts                 bearer JWT session resolution
 │   ├── origin.ts               Origin allow-list
 │   ├── rate-limit.ts           atomic fixed-window limiter + rule set
 │   ├── request-context.ts      per-request ctx (requestId, userId, clientIp)
 │   └── error-handler.ts        single public error shape
 ├── modules/
-│   ├── auth/                   demo sessions
+│   ├── auth/                   access-code JWT login/session/logout
 │   ├── uploads/                presign + verify
 │   ├── assets/                 (routes live with uploads)
 │   ├── generations/            create/status/list/download-url
